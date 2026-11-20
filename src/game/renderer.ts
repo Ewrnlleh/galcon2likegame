@@ -223,7 +223,14 @@ export class GameRenderer {
 
     // Targeting count badge rendered above planets & ships
     if (targetingBadge) {
-      this.drawTargetingBadge(ctx, targetingBadge.x, targetingBadge.y, targetingBadge.total);
+      this.drawTargetingBadge(
+        ctx,
+        targetingBadge.x,
+        targetingBadge.y,
+        targetingBadge.total,
+        sim.getFactionColor(sim.localPlayerId),
+        sim.getFactionCoreColor(sim.localPlayerId),
+      );
     }
 
     // Layer 7: Particles (additive glow)
@@ -247,10 +254,11 @@ export class GameRenderer {
       const y = Math.min(overlay.dragStartWorld.y, overlay.pointerWorld.y);
       const w = Math.abs(overlay.pointerWorld.x - overlay.dragStartWorld.x);
       const h = Math.abs(overlay.pointerWorld.y - overlay.dragStartWorld.y);
+      const localColor = sim.getFactionColor(sim.localPlayerId);
 
       ctx.save();
-      ctx.fillStyle = 'rgba(0, 229, 255, 0.12)';
-      ctx.strokeStyle = 'rgba(0, 229, 255, 0.85)';
+      ctx.fillStyle = withAlpha(localColor, 0.12);
+      ctx.strokeStyle = withAlpha(localColor, 0.85);
       ctx.lineWidth = 1.5;
       ctx.fillRect(x, y, w, h);
       ctx.strokeRect(x, y, w, h);
@@ -267,14 +275,17 @@ export class GameRenderer {
     timeSec: number,
   ): void {
     if (!showPlayerRallies) return;
+    const localId = sim.localPlayerId;
+    const localColor = sim.getFactionColor(localId);
+
     ctx.save();
     ctx.lineDashOffset = -timeSec * 36;
     ctx.setLineDash([6, 8]);
     ctx.lineWidth = 1.6;
-    ctx.strokeStyle = 'rgba(0, 229, 255, 0.42)';
+    ctx.strokeStyle = withAlpha(localColor, 0.44);
 
     for (const p of sim.planets) {
-      if (p.ownerId !== 1 || p.rallyTargetId === null) continue;
+      if (p.ownerId !== localId || p.rallyTargetId === null) continue;
       const target = sim.planetById.get(p.rallyTargetId);
       if (!target) continue;
       ctx.beginPath();
@@ -286,7 +297,7 @@ export class GameRenderer {
       const angle = Math.atan2(target.y - p.y, target.x - p.x);
       const ax = target.x - Math.cos(angle) * (target.radius + 10);
       const ay = target.y - Math.sin(angle) * (target.radius + 10);
-      ctx.fillStyle = 'rgba(0, 229, 255, 0.78)';
+      ctx.fillStyle = withAlpha(localColor, 0.82);
       ctx.beginPath();
       ctx.arc(ax, ay, 3.2, 0, Math.PI * 2);
       ctx.fill();
@@ -300,20 +311,23 @@ export class GameRenderer {
     overlay: InteractionOverlay,
     timeSec: number,
   ): { x: number; y: number; total: number } | null {
+    const localId = sim.localPlayerId;
+    const localColor = sim.getFactionColor(localId);
+
     let sources: Planet[] = [];
     if (overlay.dragState === 'planetDrag' && overlay.dragActivated && overlay.dragSourcePlanetId !== null) {
       if (
         overlay.selectedPlanetIds.has(overlay.dragSourcePlanetId) &&
         overlay.selectedPlanetIds.size > 0
       ) {
-        sources = sim.planets.filter((p) => overlay.selectedPlanetIds.has(p.id) && p.ownerId === 1);
+        sources = sim.planets.filter((p) => overlay.selectedPlanetIds.has(p.id) && p.ownerId === localId);
       } else {
         const src = sim.planetById.get(overlay.dragSourcePlanetId);
-        if (src && src.ownerId === 1) sources = [src];
+        if (src && src.ownerId === localId) sources = [src];
       }
     } else if (overlay.hoveredPlanetId !== null && overlay.selectedPlanetIds.size > 0) {
       sources = sim.planets.filter(
-        (p) => overlay.selectedPlanetIds.has(p.id) && p.ownerId === 1 && p.id !== overlay.hoveredPlanetId,
+        (p) => overlay.selectedPlanetIds.has(p.id) && p.ownerId === localId && p.id !== overlay.hoveredPlanetId,
       );
     }
 
@@ -336,7 +350,7 @@ export class GameRenderer {
         overlay.sendPercent >= 0.999 ? src.ships : Math.floor(src.ships * overlay.sendPercent);
       estimatedTotal += sendCount;
 
-      ctx.strokeStyle = hoveredTarget ? 'rgba(0, 229, 255, 0.72)' : 'rgba(0, 229, 255, 0.42)';
+      ctx.strokeStyle = withAlpha(localColor, hoveredTarget ? 0.75 : 0.44);
       ctx.beginPath();
       ctx.moveTo(src.x, src.y);
       ctx.lineTo(destX, destY);
@@ -359,20 +373,22 @@ export class GameRenderer {
     bx: number,
     by: number,
     estimatedTotal: number,
+    borderColor: string,
+    textColor: string,
   ): void {
     const label = `~${estimatedTotal}`;
     ctx.save();
     ctx.font = '700 12px Orbitron, Inter, sans-serif';
     const w = ctx.measureText(label).width + 14;
     ctx.fillStyle = 'rgba(5, 12, 28, 0.92)';
-    ctx.strokeStyle = 'rgba(0, 229, 255, 0.85)';
+    ctx.strokeStyle = withAlpha(borderColor, 0.88);
     ctx.lineWidth = 1.2;
     ctx.beginPath();
     ctx.roundRect(bx, by - 11, w, 22, 6);
     ctx.fill();
     ctx.stroke();
 
-    ctx.fillStyle = '#b8f7ff';
+    ctx.fillStyle = textColor;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(label, bx + w / 2, by);
@@ -475,7 +491,7 @@ export class GameRenderer {
     if (isHovered) {
       const pulse = 1 + 0.08 * Math.sin(timeSec * 8);
       ctx.save();
-      ctx.strokeStyle = p.ownerId === 1 ? '#00e5ff' : '#ffffff';
+      ctx.strokeStyle = p.ownerId === sim.localPlayerId ? sim.getFactionColor(sim.localPlayerId) : '#ffffff';
       ctx.lineWidth = 1.8;
       ctx.globalAlpha = 0.82;
       ctx.beginPath();

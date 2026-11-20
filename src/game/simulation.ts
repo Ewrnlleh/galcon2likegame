@@ -20,6 +20,9 @@ import type {
   MatchConfig,
   MatchStats,
   MatchStatus,
+  NetCaptureEvent,
+  NetEliminationEvent,
+  NetGameSnapshot,
   Particle,
   PendingLaunch,
   Planet,
@@ -37,6 +40,7 @@ const PERSONALITY_ROTATION: AIPersonality[] = [
 
 export class GameSimulation {
   readonly config: MatchConfig;
+  readonly localPlayerId: number;
   readonly planets: Planet[];
   readonly planetById = new Map<number, Planet>();
   readonly factions: FactionState[] = [];
@@ -60,9 +64,14 @@ export class GameSimulation {
   private nextShipId = 1;
   private nextPowerSampleTime = POWER_SAMPLE_INTERVAL;
   private spatialGrid = new Map<number, Ship[]>();
+  private pendingNetCaptures: NetCaptureEvent[] = [];
+  private pendingNetEliminations: NetEliminationEvent[] = [];
+  private localDefeatedNotified = false;
+  private matchEndNotified = false;
 
   constructor(config: MatchConfig, events: SimulationEvents = {}) {
     this.config = { ...config };
+    this.localPlayerId = config.localPlayerId ?? PLAYER_ID;
     this.events = events;
     this.planets = generateMap(this.config);
     for (const p of this.planets) {
@@ -98,13 +107,35 @@ export class GameSimulation {
     this.factions.push(neutralState);
     this.factionById.set(NEUTRAL_ID, neutralState);
 
+    if (this.config.customFactions && this.config.customFactions.length > 0) {
+      for (let i = 0; i < this.config.customFactions.length; i++) {
+        const spec = this.config.customFactions[i];
+        const palette = FACTION_PALETTE[spec.id] ?? FACTION_PALETTE[PLAYER_ID];
+        const personality = spec.isHuman
+          ? 'balanced'
+          : PERSONALITY_ROTATION[(i + (this.config.seed % 4)) % PERSONALITY_ROTATION.length];
+        const state: FactionState = {
+          ...palette,
+          id: spec.id,
+          name: spec.name,
+          isPlayer: spec.isHuman,
+          difficulty: spec.isHuman ? undefined : (spec.difficulty ?? this.config.difficulty),
+          personality,
+          eliminated: false,
+        };
+        this.factions.push(state);
+        this.factionById.set(spec.id, state);
+      }
+      return;
+    }
+
     const factionCount = Math.max(2, Math.min(6, this.config.opponents + 1));
     for (let i = 0; i < factionCount; i++) {
       const id = PLAYER_ID + i;
       const palette = FACTION_PALETTE[id];
-      const isHumanPlayer = id === PLAYER_ID && this.config.mode !== 'attract';
+      const isHumanPlayer = id === this.localPlayerId && this.config.mode !== 'attract';
       const personality =
-        id === PLAYER_ID
+        id === this.localPlayerId
           ? 'balanced'
           : PERSONALITY_ROTATION[(i + (this.config.seed % 4)) % PERSONALITY_ROTATION.length];
       const state: FactionState = {
@@ -202,7 +233,7 @@ export class GameSimulation {
     }
 
     if (totalSent > 0) {
-      if (ownerId === PLAYER_ID && this.config.mode !== 'attract') {
+      if (ownerId === this.localPlayerId && this.config.mode !== 'attract') {
         this.stats.shipsSent += totalSent;
       }
       this.events.onLaunch?.(ownerId, totalSent);
@@ -307,7 +338,7 @@ export class GameSimulation {
 
     // 6. Track player peak ships & power history
     if (this.config.mode !== 'attract') {
-      const playerSummary = this.getFactionSummary(PLAYER_ID);
+      const playerSummary = this.getFactionSummary(this.localPlayerId);
       if (playerSummary.ships > this.stats.peakShips) {
         this.stats.peakShips = playerSummary.ships;
       }
@@ -540,8 +571,10 @@ export class GameSimulation {
       target.hitFlash = Math.max(target.hitFlash, 0.38);
 
       if (isPlayerMode) {
-        if (ship.ownerId === PLAYER_ID) this.stats.shipsLost += destroyed;
-        if (target.ownerId === PLAYER_ID) this.stats.shipsDestroyed += destroyed;
+        if (ship.ownerId === this.localPlayerId || target.ownerId === this.localPlayerId) {
+          this.stats.shipsLost += destroyed;
+          this.stats.shipsDestroyed += destroyed;
+        }
       }
 
       this.spawnParticles(ship.x, ship.y, this.getFactionColor(ship.ownerId), 4, 70);
@@ -561,14 +594,24 @@ export class GameSimulation {
       target.pulseColor = this.getFactionColor(ship.ownerId);
 
       if (isPlayerMode) {
-        if (ship.ownerId === PLAYER_ID) {
+        if (ship.ownerId === this.localPlayerId) {
           this.stats.planetsCaptured++;
           this.stats.shipsDestroyed += destroyed;
-        }
-        if (oldOwnerId === PLAYER_ID) {
-          this.stats.planetsLost++;
           this.stats.shipsLost += destroyed;
         }
+        if (oldOwnerId === this.localPlayerId) {
+          this.stats.planetsLost++;
+          this.stats.shipsLost += destroyed;
+          this.stats.shipsDestroyed += destroyed;
+        }
+      }
+
+      if (this.config.mode === 'online') {
+        this.pendingNetCaptures.push({
+          planetId: target.id,
+          newOwnerId: ship.ownerId,
+          oldOwnerId,
+        });
       }
 
       this.shockwaves.push({
@@ -584,7 +627,7 @@ export class GameSimulation {
         target.id,
         ship.ownerId,
         oldOwnerId,
-        ship.ownerId === PLAYER_ID || oldOwnerId === PLAYER_ID,
+        ship.ownerId === this.localPlayerId || oldOwnerId === this.localPlayerId,
       );
     }
   }
@@ -675,6 +718,9 @@ export class GameSimulation {
       const alive = (planetCounts.get(f.id) ?? 0) > 0 || (shipCounts.get(f.id) ?? 0) > 0;
       if (!alive && !f.eliminated) {
         f.eliminated = true;
+        if (this.config.mode === 'online') {
+          this.pendingNetEliminations.push({ factionId: f.id, factionName: f.name });
+        }
         this.events.onElimination?.(f.id, f.name);
       }
       if (!f.eliminated) {
@@ -692,9 +738,29 @@ export class GameSimulation {
       return;
     }
 
-    const player = this.factionById.get(PLAYER_ID);
+    if (this.config.mode === 'online') {
+      const localFaction = this.factionById.get(this.localPlayerId);
+      const localAlive = localFaction ? !localFaction.eliminated : false;
+
+      if (!localAlive && aliveNonNeutral.length > 1 && !this.localDefeatedNotified) {
+        this.localDefeatedNotified = true;
+        this.spectating = true;
+        this.events.onLocalEliminated?.();
+      }
+
+      if (aliveNonNeutral.length <= 1 && this.status === 'playing') {
+        const winnerId = aliveNonNeutral[0]?.id ?? null;
+        this.status = winnerId === this.localPlayerId ? 'victory' : 'defeat';
+        this.stats.winnerId = winnerId;
+        this.recordPowerSample();
+        this.events.onMatchEnd?.(this.status, winnerId);
+      }
+      return;
+    }
+
+    const player = this.factionById.get(this.localPlayerId);
     const playerAlive = player ? !player.eliminated : false;
-    const aliveAIs = aliveNonNeutral.filter((f) => f.id !== PLAYER_ID);
+    const aliveAIs = aliveNonNeutral.filter((f) => f.id !== this.localPlayerId);
 
     if (!playerAlive && this.status === 'playing') {
       this.status = 'defeat';
@@ -703,13 +769,175 @@ export class GameSimulation {
       this.events.onMatchEnd?.('defeat', this.stats.winnerId);
     } else if (playerAlive && aliveAIs.length === 0 && this.status === 'playing') {
       this.status = 'victory';
-      this.stats.winnerId = PLAYER_ID;
+      this.stats.winnerId = this.localPlayerId;
       this.recordPowerSample();
-      this.events.onMatchEnd?.('victory', PLAYER_ID);
+      this.events.onMatchEnd?.('victory', this.localPlayerId);
     } else if (this.spectating && aliveNonNeutral.length <= 1) {
       this.status = 'finished';
       this.stats.winnerId = aliveNonNeutral[0]?.id ?? null;
       this.events.onMatchEnd?.('finished', this.stats.winnerId);
     }
+  }
+
+  convertFactionToBot(factionId: number): void {
+    if (factionId === NEUTRAL_ID) return;
+    const faction = this.factionById.get(factionId);
+    if (!faction) return;
+    faction.isPlayer = false;
+    faction.difficulty = this.config.difficulty;
+    if (!faction.name.endsWith(' (Bot)')) {
+      faction.name = `${faction.name} (Bot)`;
+    }
+  }
+
+  createSnapshot(): NetGameSnapshot {
+    const captures = this.pendingNetCaptures;
+    this.pendingNetCaptures = [];
+    const eliminations = this.pendingNetEliminations;
+    this.pendingNetEliminations = [];
+
+    return {
+      elapsed: Number(this.elapsed.toFixed(2)),
+      status: this.status,
+      winnerId: this.stats.winnerId,
+      planets: this.planets.map((p) => [
+        p.ownerId,
+        p.ships,
+        Math.round(p.prodProgress * 100) / 100,
+        p.rallyTargetId,
+      ]),
+      ships: this.ships.map((s) => [
+        s.id,
+        s.ownerId,
+        s.targetId,
+        Math.round(s.x * 2) / 2,
+        Math.round(s.y * 2) / 2,
+        Math.round(s.vx),
+        Math.round(s.vy),
+        s.count,
+      ]),
+      eliminatedIds: this.factions.filter((f) => f.eliminated).map((f) => f.id),
+      captures,
+      eliminations,
+      powerHistoryTail: this.stats.powerHistory[this.stats.powerHistory.length - 1],
+    };
+  }
+
+  applySnapshot(snap: NetGameSnapshot): void {
+    this.elapsed = snap.elapsed;
+    this.stats.elapsed = snap.elapsed;
+
+    for (let i = 0; i < snap.planets.length && i < this.planets.length; i++) {
+      const p = this.planets[i];
+      const [ownerId, ships, prodProgress, rallyTargetId] = snap.planets[i];
+      if (ownerId !== p.ownerId || ships < p.ships) {
+        p.hitFlash = Math.max(p.hitFlash, 0.24);
+      }
+      p.ownerId = ownerId;
+      p.ships = ships;
+      p.prodProgress = prodProgress;
+      p.rallyTargetId = rallyTargetId;
+    }
+
+    this.ships = snap.ships.map(([id, ownerId, targetId, x, y, vx, vy, count]) => ({
+      id,
+      ownerId,
+      sourceId: 0,
+      targetId,
+      x,
+      y,
+      vx,
+      vy,
+      count,
+      age: 1,
+    }));
+
+    const localFaction = this.factionById.get(this.localPlayerId);
+    const wasLocalElim = localFaction?.eliminated ?? false;
+    const elimSet = new Set(snap.eliminatedIds);
+    for (const f of this.factions) {
+      if (f.id === NEUTRAL_ID) continue;
+      f.eliminated = elimSet.has(f.id);
+    }
+    const nowLocalElim = localFaction?.eliminated ?? false;
+
+    if (snap.powerHistoryTail) {
+      const last = this.stats.powerHistory[this.stats.powerHistory.length - 1];
+      if (!last || snap.powerHistoryTail.time > last.time) {
+        this.stats.powerHistory.push(snap.powerHistoryTail);
+      }
+    }
+
+    const localSummary = this.getFactionSummary(this.localPlayerId);
+    if (localSummary.ships > this.stats.peakShips) {
+      this.stats.peakShips = localSummary.ships;
+    }
+
+    for (const cap of snap.captures) {
+      const target = this.planetById.get(cap.planetId);
+      if (target) {
+        target.capturePulse = 1.0;
+        target.pulseColor = this.getFactionColor(cap.newOwnerId);
+        this.shockwaves.push({
+          x: target.x,
+          y: target.y,
+          radius: target.radius,
+          maxRadius: target.radius + 54,
+          alpha: 0.9,
+          color: target.pulseColor,
+        });
+        this.spawnParticles(target.x, target.y, target.pulseColor, 24, 155, target.radius * 0.7);
+      }
+      if (cap.newOwnerId === this.localPlayerId) {
+        this.stats.planetsCaptured++;
+      }
+      if (cap.oldOwnerId === this.localPlayerId) {
+        this.stats.planetsLost++;
+      }
+      this.events.onCapture?.(
+        cap.planetId,
+        cap.newOwnerId,
+        cap.oldOwnerId,
+        cap.newOwnerId === this.localPlayerId || cap.oldOwnerId === this.localPlayerId,
+      );
+    }
+
+    for (const elim of snap.eliminations) {
+      this.events.onElimination?.(elim.factionId, elim.factionName);
+    }
+
+    if (!wasLocalElim && nowLocalElim && snap.status === 'playing' && !this.localDefeatedNotified) {
+      this.localDefeatedNotified = true;
+      this.spectating = true;
+      this.events.onLocalEliminated?.();
+    }
+
+    if (snap.status !== 'playing' && !this.matchEndNotified) {
+      this.matchEndNotified = true;
+      this.status = snap.winnerId === this.localPlayerId ? 'victory' : 'defeat';
+      this.stats.winnerId = snap.winnerId;
+      this.events.onMatchEnd?.(this.status, snap.winnerId);
+    }
+  }
+
+  stepClientVisuals(rawDt: number): void {
+    const dt = Math.min(0.05, Math.max(0, rawDt));
+    if (dt <= 0) return;
+
+    const { prodMult } = getRuleMultipliers(this.config.rule);
+    for (const p of this.planets) {
+      if (p.hitFlash > 0) p.hitFlash = Math.max(0, p.hitFlash - dt * 2.8);
+      if (p.capturePulse > 0) p.capturePulse = Math.max(0, p.capturePulse - dt * 1.4);
+      if (p.ownerId !== NEUTRAL_ID) {
+        p.prodProgress = Math.min(0.98, p.prodProgress + p.productionRate * prodMult * dt);
+      }
+    }
+
+    for (const ship of this.ships) {
+      ship.x += ship.vx * dt;
+      ship.y += ship.vy * dt;
+    }
+
+    this.updateEffects(dt);
   }
 }

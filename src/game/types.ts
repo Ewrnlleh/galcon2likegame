@@ -2,8 +2,15 @@ export type MapType = 'classic' | 'symmetric' | 'spiral' | 'ring' | 'grid' | 'cl
 export type Difficulty = 'easy' | 'normal' | 'hard' | 'expert';
 export type GameRule = 'standard' | 'turbo' | 'megacore' | 'superfleet';
 export type AIPersonality = 'balanced' | 'aggressive' | 'expander' | 'opportunist';
-export type MatchMode = 'skirmish' | 'campaign' | 'attract';
+export type MatchMode = 'skirmish' | 'campaign' | 'attract' | 'online';
 export type MatchStatus = 'playing' | 'victory' | 'defeat' | 'finished';
+
+export interface CustomFactionSpec {
+  id: number;
+  name: string;
+  isHuman: boolean;
+  difficulty?: Difficulty;
+}
 
 export interface FactionConfig {
   id: number;
@@ -97,6 +104,49 @@ export interface MatchConfig {
   rule: GameRule;
   seed: number;
   asymmetricStart?: boolean;
+  localPlayerId?: number;
+  customFactions?: CustomFactionSpec[];
+}
+
+export type NetPlanetTuple = [
+  ownerId: number,
+  ships: number,
+  prodProgress: number,
+  rallyTargetId: number | null,
+];
+
+export type NetShipTuple = [
+  id: number,
+  ownerId: number,
+  targetId: number,
+  x: number,
+  y: number,
+  vx: number,
+  vy: number,
+  count: number,
+];
+
+export interface NetCaptureEvent {
+  planetId: number;
+  newOwnerId: number;
+  oldOwnerId: number;
+}
+
+export interface NetEliminationEvent {
+  factionId: number;
+  factionName: string;
+}
+
+export interface NetGameSnapshot {
+  elapsed: number;
+  status: MatchStatus;
+  winnerId: number | null;
+  planets: NetPlanetTuple[];
+  ships: NetShipTuple[];
+  eliminatedIds: number[];
+  captures: NetCaptureEvent[];
+  eliminations: NetEliminationEvent[];
+  powerHistoryTail?: PowerSample;
 }
 
 export interface PowerSample {
@@ -140,6 +190,7 @@ export interface SimulationEvents {
     isPlayerInvolved: boolean,
   ) => void;
   onElimination?: (factionId: number, factionName: string) => void;
+  onLocalEliminated?: () => void;
   onMatchEnd?: (status: MatchStatus, winnerId: number | null) => void;
 }
 

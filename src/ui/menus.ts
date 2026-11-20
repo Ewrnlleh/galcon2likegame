@@ -6,9 +6,9 @@ import {
 } from '../game/campaign';
 import {
   DIFFICULTY_LABELS,
+  FACTION_PALETTE,
   MAP_TYPE_LABELS,
   NEUTRAL_ID,
-  PLAYER_ID,
   RULE_LABELS,
 } from '../game/constants';
 import { generateMiniMapPreview } from '../game/maps';
@@ -21,9 +21,26 @@ import type {
   MatchConfig,
   MatchStatus,
 } from '../game/types';
+import { loadSavedNickname, saveNickname } from '../net/peerManager';
+import {
+  MAX_ROOM_PLAYERS,
+  buildInviteUrl,
+  extractRoomCodeFromInput,
+  type NetChatMessage,
+  type NetLobbySettings,
+  type NetLobbyState,
+} from '../net/protocol';
 import { formatTime, svgIcon } from './icons';
 
-export type MenuScreen = 'none' | 'main' | 'campaign' | 'skirmish' | 'help' | 'results';
+export type MenuScreen =
+  | 'none'
+  | 'main'
+  | 'campaign'
+  | 'skirmish'
+  | 'help'
+  | 'results'
+  | 'online_entry'
+  | 'online_lobby';
 
 export interface MenuCallbacks {
   onStartMatch: (config: MatchConfig, title: string, tip?: string) => void;
@@ -31,6 +48,14 @@ export interface MenuCallbacks {
   onRestartMatch: () => void;
   onSpectateMatch: () => void;
   onCloseHelp: () => void;
+  onCreateOnlineRoom: (nickname: string) => void;
+  onJoinOnlineRoom: (code: string, nickname: string) => void;
+  onUpdateLobbySettings: (partial: Partial<NetLobbySettings>) => void;
+  onKickLobbyPlayer: (peerId: string) => void;
+  onSendLobbyChat: (text: string) => void;
+  onStartOnlineMatch: () => void;
+  onLeaveOnlineRoom: () => void;
+  onReturnToOnlineLobby: () => void;
 }
 
 export class MenuController {
@@ -39,6 +64,7 @@ export class MenuController {
 
   private activeScreen: MenuScreen = 'main';
   private helpReturnTo: MenuScreen = 'main';
+  private chatDraft = '';
 
   private skirmishConfig: MatchConfig = {
     mode: 'skirmish',
@@ -85,6 +111,10 @@ export class MenuController {
               ${svgIcon('rocket', 20)}
               <span>Hızlı Savaş (1v1)</span>
             </button>
+            <button class="btn btn-online btn-lg" id="btn-online-mp">
+              ${svgIcon('globe', 20)}
+              <span>Online Çok Oyunculu</span>
+            </button>
             <button class="btn btn-cyan btn-lg" id="btn-campaign">
               ${svgIcon('trophy', 20)}
               <span>Galaktik Sefer (10 Sektör)</span>
@@ -119,6 +149,9 @@ export class MenuController {
       this.callbacks.onStartMatch(cfg, 'Hızlı Savaş (1v1)');
     });
 
+    this.root
+      .querySelector('#btn-online-mp')!
+      .addEventListener('click', () => this.showOnlineEntry());
     this.root.querySelector('#btn-campaign')!.addEventListener('click', () => this.showCampaign());
     this.root.querySelector('#btn-skirmish')!.addEventListener('click', () => this.showSkirmish());
     this.root
@@ -461,15 +494,426 @@ export class MenuController {
     this.root.querySelector('#btn-help-ok')!.addEventListener('click', close);
   }
 
+  showOnlineEntry(prefillCode = '', statusMsg = '', errorMsg = ''): void {
+    this.activeScreen = 'online_entry';
+    const savedName = loadSavedNickname();
+    const busy = Boolean(statusMsg);
+
+    this.root.innerHTML = `
+      <div class="menu-backdrop">
+        <div class="modal-panel glass-card online-entry-panel">
+          <div class="modal-header">
+            <div>
+              <h2>ONLİNE ÇOK OYUNCULU</h2>
+              <p class="muted-text">Özel oda aç, davet linkini paylaş ve arkadaşlarınla uzaktan kapış.</p>
+            </div>
+            <button class="btn btn-sm btn-ghost" id="btn-online-back" ${busy ? 'disabled' : ''}>Ana Menü</button>
+          </div>
+
+          <div class="online-nick-bar">
+            <label for="online-nick-input">TAKMA ADIN</label>
+            <input
+              type="text"
+              id="online-nick-input"
+              maxlength="16"
+              value="${escapeHtml(savedName)}"
+              placeholder="Komutan"
+              ${busy ? 'disabled' : ''}
+            />
+          </div>
+
+          ${
+            errorMsg
+              ? `<div class="online-alert error">${escapeHtml(errorMsg)}</div>`
+              : ''
+          }
+          ${
+            statusMsg
+              ? `<div class="online-alert info"><span class="spinner-dot"></span> ${escapeHtml(statusMsg)}</div>`
+              : ''
+          }
+
+          <div class="online-entry-grid">
+            <div class="online-entry-card">
+              <h3>${svgIcon('users', 18)} Oda Kur</h3>
+              <p class="muted-text">2–6 kişilik özel bir galaksi odası oluştur, harita ve kuralları seç, arkadaşlarına link gönder.</p>
+              <button class="btn btn-primary btn-lg" id="btn-create-room" ${busy ? 'disabled' : ''}>
+                ${svgIcon('globe', 18)} Yeni Oda Oluştur
+              </button>
+            </div>
+
+            <div class="online-entry-card">
+              <h3>${svgIcon('rocket', 18)} Odaya Katıl</h3>
+              <p class="muted-text">Sana gönderilen 6 haneli oda kodunu veya davet linkini aşağıya yapıştır.</p>
+              <input
+                type="text"
+                id="online-code-input"
+                value="${escapeHtml(prefillCode)}"
+                placeholder="Örn: AB12CD veya https://.../?oda=AB12CD"
+                ${busy ? 'disabled' : ''}
+              />
+              <button class="btn btn-cyan btn-lg" id="btn-join-room" ${busy ? 'disabled' : ''}>
+                ${svgIcon('play', 18)} Odaya Katıl
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    const nickInput = this.root.querySelector<HTMLInputElement>('#online-nick-input')!;
+    const codeInput = this.root.querySelector<HTMLInputElement>('#online-code-input')!;
+
+    this.root.querySelector('#btn-online-back')!.addEventListener('click', () => {
+      this.callbacks.onLeaveOnlineRoom();
+      this.showMain();
+    });
+
+    this.root.querySelector('#btn-create-room')!.addEventListener('click', () => {
+      const nick = saveNickname(nickInput.value);
+      this.callbacks.onCreateOnlineRoom(nick);
+    });
+
+    const triggerJoin = () => {
+      const code = extractRoomCodeFromInput(codeInput.value);
+      if (!code) {
+        this.showOnlineEntry(
+          codeInput.value,
+          '',
+          'Geçerli bir 6 haneli oda kodu veya ?oda= davet linki gir.',
+        );
+        return;
+      }
+      const nick = saveNickname(nickInput.value);
+      this.callbacks.onJoinOnlineRoom(code, nick);
+    };
+
+    this.root.querySelector('#btn-join-room')!.addEventListener('click', triggerJoin);
+    codeInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') triggerJoin();
+    });
+  }
+
+  showOnlineLobby(
+    lobby: NetLobbyState,
+    chat: NetChatMessage[],
+    isHost: boolean,
+    localPeerId: string,
+  ): void {
+    const wasChatFocused = document.activeElement?.id === 'lobby-chat-input';
+    this.activeScreen = 'online_lobby';
+
+    const { settings, players } = lobby;
+    const maxBots = Math.max(0, MAX_ROOM_PLAYERS - players.length);
+    const totalFactions = Math.min(MAX_ROOM_PLAYERS, players.length + settings.botCount);
+    const canStart = totalFactions >= 2;
+
+    const playerRows = players
+      .map((p) => {
+        const pal = FACTION_PALETTE[p.factionId] ?? FACTION_PALETTE[1];
+        const isSelf = p.peerId === localPeerId;
+        const kickBtn =
+          isHost && !p.isHost
+            ? `<button class="btn btn-sm btn-danger kick-btn" data-kick="${escapeHtml(p.peerId)}">Çıkar</button>`
+            : '';
+        return `
+          <div class="lobby-player-row">
+            <div class="player-id-info">
+              <span class="faction-dot" style="background:${pal.color};box-shadow:0 0 10px ${pal.color}"></span>
+              <span class="player-name">${escapeHtml(p.name)}</span>
+              ${p.isHost ? '<span class="role-tag host">Kurucu</span>' : ''}
+              ${isSelf ? '<span class="role-tag self">Sen</span>' : ''}
+            </div>
+            ${kickBtn}
+          </div>
+        `;
+      })
+      .join('');
+
+    const botRows = Array.from({ length: settings.botCount }, (_, i) => {
+      const fid = players.length + 1 + i;
+      const pal = FACTION_PALETTE[fid] ?? FACTION_PALETTE[2];
+      return `
+        <div class="lobby-player-row bot-row">
+          <div class="player-id-info">
+            <span class="faction-dot" style="background:${pal.color}"></span>
+            <span class="player-name">${escapeHtml(pal.name)}</span>
+            <span class="role-tag bot">Bot • ${DIFFICULTY_LABELS[settings.botDifficulty].name}</span>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    const chatHtml = chat
+      .map((m) =>
+        m.system
+          ? `<div class="chat-msg sys">${escapeHtml(m.text)}</div>`
+          : `<div class="chat-msg"><strong style="color:${m.color}">${escapeHtml(m.sender)}:</strong> ${escapeHtml(m.text)}</div>`,
+      )
+      .join('');
+
+    const mapBtns = (Object.keys(MAP_TYPE_LABELS) as MapType[])
+      .map(
+        (key) => `
+        <button class="choice-pill ${settings.mapType === key ? 'active' : ''}" data-omap="${key}">${MAP_TYPE_LABELS[key].name}</button>
+      `,
+      )
+      .join('');
+
+    const sizeBtns = [
+      { label: 'Küçük (16)', count: 16 },
+      { label: 'Orta (26)', count: 26 },
+      { label: 'Büyük (38)', count: 38 },
+      { label: 'Dev (50)', count: 50 },
+    ]
+      .map(
+        (s) => `
+        <button class="choice-pill ${settings.planetCount === s.count ? 'active' : ''}" data-osize="${s.count}">${s.label}</button>
+      `,
+      )
+      .join('');
+
+    const ruleBtns = (Object.keys(RULE_LABELS) as GameRule[])
+      .map(
+        (r) => `
+        <button class="choice-pill ${settings.rule === r ? 'active' : ''}" data-orule="${r}">${RULE_LABELS[r].name}</button>
+      `,
+      )
+      .join('');
+
+    const botCountBtns = [0, 1, 2, 3, 4]
+      .filter((n) => n <= maxBots)
+      .map(
+        (n) => `
+        <button class="choice-pill ${settings.botCount === n ? 'active' : ''}" data-obots="${n}">${n === 0 ? 'Bot Yok' : `${n} Bot`}</button>
+      `,
+      )
+      .join('');
+
+    const botDiffBtns = (Object.keys(DIFFICULTY_LABELS) as Difficulty[])
+      .map(
+        (d) => `
+        <button class="choice-pill ${settings.botDifficulty === d ? 'active' : ''}" data-odiff="${d}">${DIFFICULTY_LABELS[d].name}</button>
+      `,
+      )
+      .join('');
+
+    const settingsPanel = isHost
+      ? `
+        <div class="cfg-group">
+          <label>Harita Türü</label>
+          <div class="choice-row">${mapBtns}</div>
+        </div>
+        <div class="cfg-group">
+          <label>Galaksi Boyutu</label>
+          <div class="choice-row">${sizeBtns}</div>
+        </div>
+        <div class="cfg-group">
+          <label>Oyun Kuralı</label>
+          <div class="choice-row">${ruleBtns}</div>
+        </div>
+        <div class="cfg-group">
+          <label>Yapay Zeka Botlar (Toplam Güç: ${totalFactions}/6)</label>
+          <div class="choice-row">${botCountBtns}</div>
+        </div>
+        ${
+          settings.botCount > 0
+            ? `<div class="cfg-group"><label>Bot Zorluğu</label><div class="choice-row">${botDiffBtns}</div></div>`
+            : ''
+        }
+      `
+      : `
+        <div class="guest-settings-summary">
+          <div class="summary-chip"><span>Harita</span><strong>${MAP_TYPE_LABELS[settings.mapType].name}</strong></div>
+          <div class="summary-chip"><span>Boyut</span><strong>${settings.planetCount} Gezegen</strong></div>
+          <div class="summary-chip"><span>Kural</span><strong>${RULE_LABELS[settings.rule].name}</strong></div>
+          <div class="summary-chip"><span>Botlar</span><strong>${settings.botCount > 0 ? `${settings.botCount} (${DIFFICULTY_LABELS[settings.botDifficulty].name})` : 'Yok'}</strong></div>
+        </div>
+      `;
+
+    this.root.innerHTML = `
+      <div class="menu-backdrop">
+        <div class="modal-panel glass-card wide-panel lobby-panel">
+          <div class="modal-header lobby-header">
+            <div class="lobby-room-title">
+              <span class="room-code-badge">ODA: ${escapeHtml(lobby.roomCode)}</span>
+              <button class="btn btn-sm btn-cyan" id="btn-copy-invite">
+                ${svgIcon('copy', 15)} <span>Davet Linkini Kopyala</span>
+              </button>
+            </div>
+            <button class="btn btn-sm btn-danger" id="btn-leave-lobby">Odadan Ayrıl</button>
+          </div>
+
+          <div class="lobby-layout">
+            <div class="lobby-left">
+              <div class="lobby-section">
+                <div class="lobby-section-title">OYUNCULAR (${totalFactions}/${MAX_ROOM_PLAYERS})</div>
+                <div class="lobby-players-list">
+                  ${playerRows}
+                  ${botRows}
+                </div>
+              </div>
+
+              <div class="lobby-chat-box">
+                <div class="lobby-section-title">ODA SOHBETİ</div>
+                <div class="lobby-chat-messages" id="lobby-chat-messages">${chatHtml}</div>
+                <div class="lobby-chat-input-row">
+                  <input type="text" id="lobby-chat-input" maxlength="140" placeholder="Mesaj yaz..." value="${escapeHtml(this.chatDraft)}" />
+                  <button class="btn btn-sm btn-cyan" id="btn-send-chat" title="Gönder">${svgIcon('send', 15)}</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="lobby-right">
+              ${settingsPanel}
+
+              <div class="preview-box">
+                <div class="preview-top">
+                  <span>CANLI HARİTA ÖNİZLEMESİ</span>
+                  ${
+                    isHost
+                      ? `<button class="btn btn-sm btn-ghost" id="btn-lobby-new-seed">${svgIcon('shuffle', 14)} Yeni Tohum</button>`
+                      : `<span class="muted-seed">Tohum #${settings.seed}</span>`
+                  }
+                </div>
+                <canvas id="online-minimap" width="420" height="236"></canvas>
+              </div>
+
+              ${
+                isHost
+                  ? `
+                    <button class="btn btn-primary btn-lg start-skirmish-btn" id="btn-start-online" ${canStart ? '' : 'disabled'}>
+                      ${svgIcon('rocket', 20)} Savaşı Başlat
+                    </button>
+                    ${
+                      !canStart
+                        ? `<p class="lobby-hint-warn">Başlatmak için bir arkadaş davet et veya yapay zeka bot ekle.</p>`
+                        : ''
+                    }
+                  `
+                  : `<div class="guest-waiting-pill">Oda kurucusunun maçı başlatması bekleniyor...</div>`
+              }
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    const miniCanvas = this.root.querySelector<HTMLCanvasElement>('#online-minimap');
+    if (miniCanvas) {
+      const previewPlanets = generateMiniMapPreview(
+        settings.mapType,
+        Math.max(1, totalFactions - 1),
+        settings.planetCount,
+        settings.seed,
+        settings.rule,
+      );
+      renderMiniMapPreview(miniCanvas, previewPlanets);
+    }
+
+    const chatBox = this.root.querySelector<HTMLElement>('#lobby-chat-messages');
+    if (chatBox) chatBox.scrollTop = chatBox.scrollHeight;
+
+    const chatInput = this.root.querySelector<HTMLInputElement>('#lobby-chat-input');
+    if (chatInput) {
+      if (wasChatFocused) {
+        chatInput.focus();
+        chatInput.setSelectionRange(chatInput.value.length, chatInput.value.length);
+      }
+      chatInput.addEventListener('input', () => {
+        this.chatDraft = chatInput.value;
+      });
+      const submitChat = () => {
+        const text = chatInput.value.trim();
+        if (!text) return;
+        this.chatDraft = '';
+        chatInput.value = '';
+        this.callbacks.onSendLobbyChat(text);
+      };
+      chatInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') submitChat();
+      });
+      this.root.querySelector('#btn-send-chat')?.addEventListener('click', submitChat);
+    }
+
+    const copyBtn = this.root.querySelector<HTMLButtonElement>('#btn-copy-invite')!;
+    copyBtn.addEventListener('click', () => {
+      const url = buildInviteUrl(lobby.roomCode);
+      const markCopied = () => {
+        copyBtn.innerHTML = `${svgIcon('check', 15)} <span>Kopyalandı ✓</span>`;
+        setTimeout(() => {
+          if (copyBtn.isConnected) {
+            copyBtn.innerHTML = `${svgIcon('copy', 15)} <span>Davet Linkini Kopyala</span>`;
+          }
+        }, 2000);
+      };
+      if (navigator.clipboard?.writeText) {
+        void navigator.clipboard.writeText(url).then(markCopied).catch(() => {
+          window.prompt('Davet linkini kopyala:', url);
+        });
+      } else {
+        window.prompt('Davet linkini kopyala:', url);
+      }
+    });
+
+    this.root.querySelector('#btn-leave-lobby')!.addEventListener('click', () => {
+      this.chatDraft = '';
+      this.callbacks.onLeaveOnlineRoom();
+    });
+
+    if (isHost) {
+      for (const btn of this.root.querySelectorAll<HTMLButtonElement>('.kick-btn')) {
+        btn.addEventListener('click', () => {
+          const pid = btn.dataset.kick;
+          if (pid) this.callbacks.onKickLobbyPlayer(pid);
+        });
+      }
+
+      const bindSetting = (selector: string, attr: string, handler: (val: string) => void) => {
+        for (const btn of this.root.querySelectorAll<HTMLButtonElement>(selector)) {
+          btn.addEventListener('click', () => handler(btn.getAttribute(attr)!));
+        }
+      };
+
+      bindSetting('[data-omap]', 'data-omap', (val) =>
+        this.callbacks.onUpdateLobbySettings({ mapType: val as MapType }),
+      );
+      bindSetting('[data-osize]', 'data-osize', (val) =>
+        this.callbacks.onUpdateLobbySettings({ planetCount: Number(val) }),
+      );
+      bindSetting('[data-orule]', 'data-orule', (val) =>
+        this.callbacks.onUpdateLobbySettings({ rule: val as GameRule }),
+      );
+      bindSetting('[data-obots]', 'data-obots', (val) =>
+        this.callbacks.onUpdateLobbySettings({ botCount: Number(val) }),
+      );
+      bindSetting('[data-odiff]', 'data-odiff', (val) =>
+        this.callbacks.onUpdateLobbySettings({ botDifficulty: val as Difficulty }),
+      );
+
+      this.root.querySelector('#btn-lobby-new-seed')?.addEventListener('click', () => {
+        this.callbacks.onUpdateLobbySettings({
+          seed: Math.floor(Math.random() * 900000) + 10000,
+        });
+      });
+
+      this.root.querySelector('#btn-start-online')?.addEventListener('click', () => {
+        this.callbacks.onStartOnlineMatch();
+      });
+    }
+  }
+
   showResults(
     sim: GameSimulation,
     status: MatchStatus,
     earnedStars: number | null,
     hasNextSector: boolean,
     onNextSector?: () => void,
+    onlineCtx?: { isHost: boolean },
   ): void {
     this.activeScreen = 'results';
     const isVictory = status === 'victory';
+    const isOnline = sim.config.mode === 'online';
 
     const starsBlock =
       sim.config.mode === 'campaign' && isVictory && earnedStars !== null
@@ -486,14 +930,46 @@ export class MenuController {
 
     const canSpectate =
       !isVictory &&
-      sim.factions.filter((f) => f.id !== NEUTRAL_ID && f.id !== PLAYER_ID && !f.eliminated)
-        .length > 1;
+      sim.factions.filter(
+        (f) => f.id !== NEUTRAL_ID && f.id !== sim.localPlayerId && !f.eliminated,
+      ).length > 1;
+
+    const tagText =
+      sim.config.mode === 'campaign'
+        ? `SEKTÖR ${sim.config.sectorId}`
+        : isOnline
+          ? 'ONLİNE MAÇ SONUCU'
+          : 'SKİRMİSH SONUCU';
+
+    const actionsHtml = isOnline
+      ? `
+        ${
+          onlineCtx?.isHost
+            ? `<button class="btn btn-primary" id="res-online-lobby">${svgIcon('users', 16)} Lobiye Dön</button>`
+            : `<span class="guest-lobby-wait">Oda kurucusu lobiye döndüğünde yeni maç başlayacaktır.</span>`
+        }
+        <button class="btn btn-ghost" id="res-main">${svgIcon('home', 16)} Odadan Çık</button>
+      `
+      : `
+        ${
+          isVictory && hasNextSector
+            ? `<button class="btn btn-primary" id="res-next-sector">${svgIcon('play', 16)} Sonraki Sektör</button>`
+            : ''
+        }
+        <button class="btn btn-cyan" id="res-replay">${svgIcon('rotateCcw', 16)} Tekrar Oyna</button>
+        ${
+          canSpectate
+            ? `<button class="btn btn-ghost" id="res-spectate">İzlemeye Devam Et</button>`
+            : ''
+        }
+        <button class="btn btn-ghost" id="res-main">${svgIcon('home', 16)} Ana Menü</button>
+      `;
 
     this.root.innerHTML = `
       <div class="menu-backdrop">
         <div class="modal-panel glass-card results-panel">
           <div class="results-hero ${isVictory ? 'win' : 'loss'}">
-            <span class="results-tag">${sim.config.mode === 'campaign' ? `SEKTÖR ${sim.config.sectorId}` : 'SKİRMİSH SONUCU'}</span>
+            <span class="results-tag">${tagText}</span>
             <h2>${isVictory ? 'GALAKTİK ZAFER!' : 'FİLO İMHA EDİLDİ'}</h2>
             ${starsBlock}
           </div>
@@ -529,7 +1005,7 @@ export class MenuController {
                   .filter((f) => f.id !== NEUTRAL_ID)
                   .map(
                     (f) =>
-                      `<span class="legend-chip"><i style="background:${f.color}"></i>${f.name}</span>`,
+                      `<span class="legend-chip"><i style="background:${f.color}"></i>${escapeHtml(f.name)}</span>`,
                   )
                   .join('')}
               </div>
@@ -538,25 +1014,17 @@ export class MenuController {
           </div>
 
           <div class="results-actions">
-            ${
-              isVictory && hasNextSector
-                ? `<button class="btn btn-primary" id="res-next-sector">${svgIcon('play', 16)} Sonraki Sektör</button>`
-                : ''
-            }
-            <button class="btn btn-cyan" id="res-replay">${svgIcon('rotateCcw', 16)} Tekrar Oyna</button>
-            ${
-              canSpectate
-                ? `<button class="btn btn-ghost" id="res-spectate">İzlemeye Devam Et</button>`
-                : ''
-            }
-            <button class="btn btn-ghost" id="res-main">${svgIcon('home', 16)} Ana Menü</button>
+            ${actionsHtml}
           </div>
         </div>
       </div>
     `;
 
-    this.root.querySelector('#res-replay')!.addEventListener('click', () => {
+    this.root.querySelector('#res-replay')?.addEventListener('click', () => {
       this.callbacks.onRestartMatch();
+    });
+    this.root.querySelector('#res-online-lobby')?.addEventListener('click', () => {
+      this.callbacks.onReturnToOnlineLobby();
     });
     this.root.querySelector('#res-main')!.addEventListener('click', () => {
       this.callbacks.onReturnToMain();
@@ -575,6 +1043,15 @@ export class MenuController {
       nextBtn.addEventListener('click', onNextSector);
     }
   }
+}
+
+function escapeHtml(raw: string): string {
+  return raw
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function buildPowerChartSvg(sim: GameSimulation): string {
@@ -627,7 +1104,7 @@ function buildPowerChartSvg(sim: GameSimulation): string {
           return `${x.toFixed(1)},${y.toFixed(1)}`;
         })
         .join(' ');
-      return `<polyline fill="none" stroke="${f.color}" stroke-width="${f.id === PLAYER_ID ? 2.6 : 1.9}" stroke-linejoin="round" stroke-linecap="round" points="${pts}"/>`;
+      return `<polyline fill="none" stroke="${f.color}" stroke-width="${f.id === sim.localPlayerId ? 2.6 : 1.9}" stroke-linejoin="round" stroke-linecap="round" points="${pts}"/>`;
     })
     .join('');
 

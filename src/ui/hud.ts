@@ -1,4 +1,4 @@
-import { NEUTRAL_ID, PLAYER_ID } from '../game/constants';
+import { NEUTRAL_ID } from '../game/constants';
 import type { GameSimulation } from '../game/simulation';
 import { formatTime, svgIcon } from './icons';
 
@@ -20,12 +20,19 @@ export class HudController {
   private matchLabel = 'Hızlı Savaş';
   private visible = false;
   private muted = false;
+  private onlineMode = false;
   private lastHudUpdate = 0;
 
   private topBarEl!: HTMLElement;
   private bottomDockEl!: HTMLElement;
   private toastContainerEl!: HTMLElement;
   private pauseOverlayEl!: HTMLElement;
+  private pauseTitleEl!: HTMLElement;
+  private pauseDescEl!: HTMLElement;
+  private pauseResumeBtnEl!: HTMLButtonElement;
+  private pauseRestartBtnEl!: HTMLButtonElement;
+  private pauseMenuBtnEl!: HTMLButtonElement;
+  private localPills: HTMLElement[] = [];
 
   private titleEl!: HTMLElement;
   private pauseBtnEl!: HTMLButtonElement;
@@ -74,15 +81,15 @@ export class HudController {
               <span class="pill-label">Süre</span>
               <span class="pill-val" id="hud-timer">00:00</span>
             </div>
-            <div class="hud-stat-pill cyan">
+            <div class="hud-stat-pill cyan local-pill">
               <span class="pill-label">Gezegen</span>
               <span class="pill-val" id="hud-planets">0</span>
             </div>
-            <div class="hud-stat-pill cyan">
+            <div class="hud-stat-pill cyan local-pill">
               <span class="pill-label">Gemi</span>
               <span class="pill-val" id="hud-ships">0</span>
             </div>
-            <div class="hud-stat-pill cyan">
+            <div class="hud-stat-pill cyan local-pill">
               <span class="pill-label">Üretim</span>
               <span class="pill-val" id="hud-prod">+0.0/sn</span>
             </div>
@@ -113,8 +120,8 @@ export class HudController {
 
         <div class="pause-overlay hidden" id="pause-overlay">
           <div class="glass-card pause-card">
-            <h2>OYUN DURAKLATILDI</h2>
-            <p class="muted-text">Filo emirleri beklemede.</p>
+            <h2 id="pause-title">OYUN DURAKLATILDI</h2>
+            <p class="muted-text" id="pause-desc">Filo emirleri beklemede.</p>
             <div class="pause-actions">
               <button class="btn btn-cyan" id="pause-resume-btn">${svgIcon('play', 16)} Devam Et</button>
               <button class="btn btn-ghost" id="pause-restart-btn">${svgIcon('rotateCcw', 16)} Yeniden Başlat</button>
@@ -130,6 +137,12 @@ export class HudController {
     this.bottomDockEl = this.root.querySelector('#hud-bottom')!;
     this.toastContainerEl = this.root.querySelector('#hud-toasts')!;
     this.pauseOverlayEl = this.root.querySelector('#pause-overlay')!;
+    this.pauseTitleEl = this.root.querySelector('#pause-title')!;
+    this.pauseDescEl = this.root.querySelector('#pause-desc')!;
+    this.pauseResumeBtnEl = this.root.querySelector('#pause-resume-btn')!;
+    this.pauseRestartBtnEl = this.root.querySelector('#pause-restart-btn')!;
+    this.pauseMenuBtnEl = this.root.querySelector('#pause-menu-btn')!;
+    this.localPills = [...this.root.querySelectorAll<HTMLElement>('.local-pill')];
     this.spectateBannerEl = this.root.querySelector('#spectate-banner')!;
 
     this.titleEl = this.root.querySelector('#hud-match-title')!;
@@ -201,8 +214,25 @@ export class HudController {
   }
 
   setPaused(paused: boolean, showOverlay: boolean): void {
-    this.pauseBtnEl.innerHTML = svgIcon(paused ? 'play' : 'pause', 16);
-    this.pauseOverlayEl.classList.toggle('hidden', !(paused && showOverlay && this.visible));
+    this.pauseBtnEl.innerHTML = svgIcon(paused && !this.onlineMode ? 'play' : 'pause', 16);
+    this.pauseOverlayEl.classList.toggle('hidden', !(showOverlay && this.visible));
+  }
+
+  isPauseOverlayVisible(): boolean {
+    return !this.pauseOverlayEl.classList.contains('hidden');
+  }
+
+  setOnlineMode(isOnline: boolean): void {
+    this.onlineMode = isOnline;
+    this.speedBtnEl.classList.toggle('hidden', isOnline);
+    this.pauseBtnEl.title = isOnline ? 'Oyun Menüsü (Esc)' : 'Duraklat (Boşluk)';
+    this.pauseRestartBtnEl.classList.toggle('hidden', isOnline);
+    this.pauseTitleEl.textContent = isOnline ? 'OYUN MENÜSÜ' : 'OYUN DURAKLATILDI';
+    this.pauseDescEl.textContent = isOnline
+      ? 'Canlı online maç arka planda devam ediyor.'
+      : 'Filo emirleri beklemede.';
+    this.pauseResumeBtnEl.innerHTML = `${svgIcon('play', 16)} ${isOnline ? 'Oyuna Dön' : 'Devam Et'}`;
+    this.pauseMenuBtnEl.innerHTML = `${svgIcon('home', 16)} ${isOnline ? 'Odadan Ayrıl' : 'Ana Menü'}`;
   }
 
   setSpeed(speed: 1 | 1.5 | 2): void {
@@ -236,7 +266,13 @@ export class HudController {
 
     this.timerEl.textContent = formatTime(sim.elapsed);
 
-    const playerSummary = sim.getFactionSummary(PLAYER_ID);
+    const localId = sim.localPlayerId;
+    const localColor = sim.getFactionColor(localId);
+    for (const pill of this.localPills) {
+      pill.style.borderColor = `${localColor}66`;
+    }
+
+    const playerSummary = sim.getFactionSummary(localId);
     this.playerPlanetsEl.textContent = String(playerSummary.planets);
     this.playerShipsEl.textContent = String(playerSummary.ships);
     this.playerProdEl.textContent = `+${playerSummary.production.toFixed(1)}/sn`;
@@ -263,7 +299,13 @@ export class HudController {
 
     this.powerLegendEl.innerHTML = factionPowers
       .map((fp) => {
-        const shortName = fp.id === PLAYER_ID ? 'Sen' : fp.name.split(' ')[0];
+        const baseName = fp.name.slice(0, 12);
+        const shortName =
+          fp.id === localId
+            ? sim.config.mode === 'online'
+              ? `${baseName} (Sen)`
+              : 'Sen'
+            : fp.name.split(' ')[0];
         return `<span class="legend-chip"><i style="background:${fp.color}"></i>${shortName} <b>${fp.ships}</b></span>`;
       })
       .join('');

@@ -1,4 +1,3 @@
-import { PLAYER_ID } from './constants';
 import type { SoundEngine } from './audio';
 import type { GameRenderer, InteractionOverlay } from './renderer';
 import type { GameSimulation } from './simulation';
@@ -12,6 +11,9 @@ export interface InputCallbacks {
   onToggleMute: () => void;
   onEscapeAction: () => void;
   onToast?: (message: string) => void;
+  onSendCommand?: (fromPlanetIds: number[], targetPlanetId: number, percent: number) => void;
+  onRedirectCommand?: (shipIds: number[], targetPlanetId: number) => void;
+  onRallyCommand?: (planetIds: number[], targetPlanetId: number | null) => void;
 }
 
 export class InputController {
@@ -80,9 +82,10 @@ export class InputController {
 
   pruneInvalidSelections(): void {
     const sim = this.simGetter();
+    const localId = sim.localPlayerId;
     for (const id of [...this.selectedPlanetIds]) {
       const p = sim.planetById.get(id);
-      if (!p || p.ownerId !== PLAYER_ID) {
+      if (!p || p.ownerId !== localId) {
         this.selectedPlanetIds.delete(id);
       }
     }
@@ -111,15 +114,43 @@ export class InputController {
   selectAllPlayerPlanets(): void {
     const sim = this.simGetter();
     if (sim.config.mode === 'attract' || sim.status !== 'playing') return;
+    const localId = sim.localPlayerId;
     this.selectedShipIds.clear();
     this.selectedPlanetIds.clear();
     for (const p of sim.planets) {
-      if (p.ownerId === PLAYER_ID) {
+      if (p.ownerId === localId) {
         this.selectedPlanetIds.add(p.id);
       }
     }
     if (this.selectedPlanetIds.size > 0) {
       this.audio.playSelect();
+    }
+  }
+
+  private dispatchSend(fromIds: number[], targetId: number, percent: number): void {
+    const sim = this.simGetter();
+    if (this.callbacks.onSendCommand) {
+      this.callbacks.onSendCommand(fromIds, targetId, percent);
+    } else {
+      sim.sendShips(fromIds, targetId, sim.localPlayerId, percent);
+    }
+  }
+
+  private dispatchRedirect(shipIds: number[], targetId: number): void {
+    const sim = this.simGetter();
+    if (this.callbacks.onRedirectCommand) {
+      this.callbacks.onRedirectCommand(shipIds, targetId);
+    } else {
+      sim.redirectShips(shipIds, targetId, sim.localPlayerId);
+    }
+  }
+
+  private dispatchRally(planetIds: number[], targetId: number | null): void {
+    const sim = this.simGetter();
+    if (this.callbacks.onRallyCommand) {
+      this.callbacks.onRallyCommand(planetIds, targetId);
+    } else {
+      sim.setRallyPoint(planetIds, targetId, sim.localPlayerId);
     }
   }
 
@@ -173,6 +204,8 @@ export class InputController {
     const hit = this.hitTestPlanet(world.x, world.y);
     this.hoveredPlanetId = hit ? hit.id : null;
 
+    const localId = sim.localPlayerId;
+
     // Right click: attack / reinforce / rally point
     if (e.button === 2) {
       e.preventDefault();
@@ -180,7 +213,7 @@ export class InputController {
 
       if (e.shiftKey) {
         if (this.selectedPlanetIds.size > 0) {
-          sim.setRallyPoint([...this.selectedPlanetIds], hit.id, PLAYER_ID);
+          this.dispatchRally([...this.selectedPlanetIds], hit.id);
           this.audio.playSelect();
           const clearing =
             this.selectedPlanetIds.size === 1 && this.selectedPlanetIds.has(hit.id);
@@ -192,10 +225,10 @@ export class InputController {
       }
 
       if (this.selectedPlanetIds.size > 0) {
-        sim.sendShips([...this.selectedPlanetIds], hit.id, PLAYER_ID, this.sendPercent);
+        this.dispatchSend([...this.selectedPlanetIds], hit.id, this.sendPercent);
       }
       if (this.selectedShipIds.size > 0) {
-        sim.redirectShips([...this.selectedShipIds], hit.id, PLAYER_ID);
+        this.dispatchRedirect([...this.selectedShipIds], hit.id);
       }
       return;
     }
@@ -207,7 +240,7 @@ export class InputController {
     this.dragStartWorld = { x: world.x, y: world.y };
     this.dragActivated = false;
 
-    if (hit && hit.ownerId === PLAYER_ID) {
+    if (hit && hit.ownerId === localId) {
       this.dragState = 'planetDrag';
       this.dragSourcePlanetId = hit.id;
     } else {
@@ -244,10 +277,11 @@ export class InputController {
       const minY = Math.min(this.dragStartWorld.y, world.y);
       const maxY = Math.max(this.dragStartWorld.y, world.y);
 
+      const localId = sim.localPlayerId;
       const caughtPlanets: number[] = [];
       for (const p of sim.planets) {
         if (
-          p.ownerId === PLAYER_ID &&
+          p.ownerId === localId &&
           p.x >= minX - p.radius * 0.4 &&
           p.x <= maxX + p.radius * 0.4 &&
           p.y >= minY - p.radius * 0.4 &&
@@ -272,6 +306,8 @@ export class InputController {
     this.pointerWorld = world;
     const hit = this.hitTestPlanet(world.x, world.y);
 
+    const localId = sim.localPlayerId;
+
     if (this.dragState === 'planetDrag' && this.dragSourcePlanetId !== null) {
       if (this.dragActivated) {
         if (hit && hit.id !== this.dragSourcePlanetId) {
@@ -280,7 +316,7 @@ export class InputController {
             this.selectedPlanetIds.size > 0
               ? [...this.selectedPlanetIds]
               : [this.dragSourcePlanetId];
-          sim.sendShips(sources, hit.id, PLAYER_ID, this.sendPercent);
+          this.dispatchSend(sources, hit.id, this.sendPercent);
         }
       } else {
         // Click on owned planet
@@ -317,7 +353,7 @@ export class InputController {
         const caughtPlanets: number[] = [];
         for (const p of sim.planets) {
           if (
-            p.ownerId === PLAYER_ID &&
+            p.ownerId === localId &&
             p.x >= minX - p.radius * 0.4 &&
             p.x <= maxX + p.radius * 0.4 &&
             p.y >= minY - p.radius * 0.4 &&
@@ -337,7 +373,7 @@ export class InputController {
           const caughtShips: number[] = [];
           for (const s of sim.ships) {
             if (
-              s.ownerId === PLAYER_ID &&
+              s.ownerId === localId &&
               s.x >= minX &&
               s.x <= maxX &&
               s.y >= minY &&
@@ -358,12 +394,12 @@ export class InputController {
         }
       } else {
         // Simple click on non-owned planet or empty space
-        if (hit && hit.ownerId !== PLAYER_ID && (this.selectedPlanetIds.size > 0 || this.selectedShipIds.size > 0)) {
+        if (hit && hit.ownerId !== localId && (this.selectedPlanetIds.size > 0 || this.selectedShipIds.size > 0)) {
           if (this.selectedPlanetIds.size > 0) {
-            sim.sendShips([...this.selectedPlanetIds], hit.id, PLAYER_ID, this.sendPercent);
+            this.dispatchSend([...this.selectedPlanetIds], hit.id, this.sendPercent);
           }
           if (this.selectedShipIds.size > 0) {
-            sim.redirectShips([...this.selectedShipIds], hit.id, PLAYER_ID);
+            this.dispatchRedirect([...this.selectedShipIds], hit.id);
           }
         } else if (!hit && !e.shiftKey) {
           this.selectedPlanetIds.clear();
@@ -455,8 +491,8 @@ export class InputController {
         const ids =
           this.selectedPlanetIds.size > 0
             ? [...this.selectedPlanetIds]
-            : sim.planets.filter((p) => p.ownerId === PLAYER_ID).map((p) => p.id);
-        sim.setRallyPoint(ids, null, PLAYER_ID);
+            : sim.planets.filter((p) => p.ownerId === sim.localPlayerId).map((p) => p.id);
+        this.dispatchRally(ids, null);
         this.callbacks.onToast?.('Ralli noktaları temizlendi');
         break;
       }
